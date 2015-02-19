@@ -465,7 +465,6 @@ static int pp_read_pa_v2_regs(char __iomem *addr,
 				u32 disp_num);
 static void pp_read_pa_mem_col_regs(char __iomem *addr,
 				struct mdp_pa_mem_col_cfg *mem_col_cfg);
-static struct msm_fb_data_type *mdss_get_mfd_from_index(int index);
 static int mdss_ad_init_checks(struct msm_fb_data_type *mfd);
 static int mdss_mdp_get_ad(struct msm_fb_data_type *mfd,
 					struct mdss_ad_info **ad);
@@ -489,6 +488,7 @@ static int pp_ad_linearize_bl(struct mdss_ad_info *ad, u32 bl, u32 *bl_out,
 static int pp_ad_calc_bl(struct msm_fb_data_type *mfd, int bl_in, int *bl_out,
 		bool *bl_out_notify);
 static int pp_ad_shutdown_cleanup(struct msm_fb_data_type *mfd);
+static struct msm_fb_data_type *mdss_get_mfd_from_index(int index);
 static int pp_num_to_side(struct mdss_mdp_ctl *ctl, u32 num);
 static inline bool pp_sts_is_enabled(u32 sts, int side);
 static inline void pp_sts_set_split_bits(u32 *sts, u32 bits);
@@ -5279,10 +5279,11 @@ static int  pp_ad_attenuate_bl(struct mdss_ad_info *ad, u32 bl, u32 *bl_out)
 		return -EINVAL;
 	}
 	lut_interval = (MDSS_MDP_AD_BL_SCALE + 1) / (AD_BL_ATT_LUT_LEN - 1);
-	bl_att = ad->bl_att_lut[n] + (bl - lut_interval * n) *
-			(ad->bl_att_lut[n + 1] - ad->bl_att_lut[n]) /
-			lut_interval;
-	pr_debug("n = %d, bl_att = %d\n", n, bl_att);
+	bl_att = ((ad->bl_att_lut[n + 1] - ad->bl_att_lut[n]) *
+		(bl - lut_interval * n) + (ad->bl_att_lut[n] * lut_interval)) /
+		lut_interval;
+	pr_debug("n = %u, bl_att_lut[%u] = %u, bl_att_lut[%u] = %u, bl_att = %u\n",
+		n, n, ad->bl_att_lut[n], n + 1, ad->bl_att_lut[n + 1], bl_att);
 	if (ad->init.alpha_base)
 		*bl_out = (ad->init.alpha * bl_att +
 			(ad->init.alpha_base - ad->init.alpha) * bl) /
@@ -5305,6 +5306,7 @@ static int pp_ad_linearize_bl(struct mdss_ad_info *ad, u32 bl, u32 *bl_out,
 {
 
 	u32 n;
+	uint32_t *bl_lut = NULL;
 	int ret = -EINVAL;
 
 	if (bl < 0 || bl > ad->bl_mfd->panel_info->bl_max) {
@@ -5314,6 +5316,14 @@ static int pp_ad_linearize_bl(struct mdss_ad_info *ad, u32 bl, u32 *bl_out,
 	}
 
 	pr_debug("bl_in = %d, inv = %d\n", bl, inv);
+	if (inv == MDP_PP_AD_BL_LINEAR_INV) {
+		bl_lut = ad->bl_lin;
+	} else if (inv == MDP_PP_AD_BL_LINEAR) {
+		bl_lut = ad->bl_lin_inv;
+	} else {
+		pr_err("invalid inv param: inv = %d\n", inv);
+		return -EINVAL;
+	}
 
 	/* map panel backlight range to AD backlight range */
 	linear_map(bl, &bl, ad->bl_mfd->panel_info->bl_max,
@@ -5321,30 +5331,19 @@ static int pp_ad_linearize_bl(struct mdss_ad_info *ad, u32 bl, u32 *bl_out,
 
 	pr_debug("Before linearization = %d\n", bl);
 	n = bl * (AD_BL_LIN_LEN - 1) / MDSS_MDP_AD_BL_SCALE;
-	pr_debug("n = %d\n", n);
+	pr_debug("n = %u\n", n);
 	if (n > (AD_BL_LIN_LEN - 1)) {
 		pr_err("Invalid index for BL linearization: %d.\n", n);
 		return ret;
 	} else if (n == (AD_BL_LIN_LEN - 1)) {
-		if (inv == MDP_PP_AD_BL_LINEAR_INV)
-			*bl_out = ad->bl_lin_inv[n];
-		else if (inv == MDP_PP_AD_BL_LINEAR)
-			*bl_out = ad->bl_lin[n];
+		*bl_out = bl_lut[n];
 	} else {
 		/* linear piece-wise interpolation */
-		if (inv == MDP_PP_AD_BL_LINEAR_INV) {
-			*bl_out = bl * (AD_BL_LIN_LEN - 1) *
-				(ad->bl_lin_inv[n + 1] - ad->bl_lin_inv[n]) /
-				MDSS_MDP_AD_BL_SCALE - n *
-				(ad->bl_lin_inv[n + 1] - ad->bl_lin_inv[n]) +
-				ad->bl_lin_inv[n];
-		} else if (inv == MDP_PP_AD_BL_LINEAR) {
-			*bl_out = bl * (AD_BL_LIN_LEN - 1) *
-				(ad->bl_lin[n + 1] - ad->bl_lin[n]) /
-				MDSS_MDP_AD_BL_SCALE -
-				n * (ad->bl_lin[n + 1] - ad->bl_lin[n]) +
-				ad->bl_lin[n];
-		}
+		*bl_out = ((bl_lut[n + 1] - bl_lut[n]) *
+			(bl - n * MDSS_MDP_AD_BL_SCALE /
+			(AD_BL_LIN_LEN  - 1)) + bl_lut[n] *
+			MDSS_MDP_AD_BL_SCALE / (AD_BL_LIN_LEN  - 1)) *
+			(AD_BL_LIN_LEN  - 1) / MDSS_MDP_AD_BL_SCALE;
 	}
 	pr_debug("After linearization = %d\n", *bl_out);
 

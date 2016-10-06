@@ -2134,9 +2134,11 @@ retry_find_task:
 		 * only need to check permissions on one of them.
 		 */
 		tcred = __task_cred(tsk);
-		if (!uid_eq(cred->euid, GLOBAL_ROOT_UID) &&
+		if (!uid_eq(cred->euid, GLOBAL_SYSTEM_UID) &&
+		    !uid_eq(cred->euid, GLOBAL_ROOT_UID) &&
 		    !uid_eq(cred->euid, tcred->uid) &&
-		    !uid_eq(cred->euid, tcred->suid)) {
+		    !uid_eq(cred->euid, tcred->suid) &&
+		    !ns_capable(tcred->user_ns, CAP_SYS_NICE)) {
 			rcu_read_unlock();
 			ret = -EACCES;
 			goto out_unlock_cgroup;

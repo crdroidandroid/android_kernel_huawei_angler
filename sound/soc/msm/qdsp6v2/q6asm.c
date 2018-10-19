@@ -60,13 +60,8 @@ struct asm_mmap {
 };
 
 static struct asm_mmap this_mmap;
-
-struct audio_session {
-	struct audio_client *ac;
-	spinlock_t session_lock;
-};
 /* session id: 0 reserved */
-static struct audio_session session[SESSION_MAX + 1];
+static struct audio_client *session[SESSION_MAX+1];
 
 struct asm_buffer_node {
 	struct list_head list;
@@ -407,8 +402,8 @@ static int q6asm_session_alloc(struct audio_client *ac)
 {
 	int n;
 	for (n = 1; n <= SESSION_MAX; n++) {
-		if (!session[n].ac) {
-			session[n].ac = ac;
+		if (!session[n]) {
+			session[n] = ac;
 			return n;
 		}
 	}
@@ -416,41 +411,24 @@ static int q6asm_session_alloc(struct audio_client *ac)
 	return -ENOMEM;
 }
 
-static unsigned int q6asm_get_session_id_from_audio_client(
-			struct audio_client *ac)
+static bool q6asm_is_valid_audio_client(struct audio_client *ac)
 {
-	unsigned int n;
-
+	int n;
 	for (n = 1; n <= SESSION_MAX; n++) {
-		if (session[n].ac == ac)
-			return n;
+		if (session[n] == ac)
+			return 1;
 	}
 	return 0;
 }
 
-static bool q6asm_is_valid_audio_client(struct audio_client *ac)
-{
-	return q6asm_get_session_id_from_audio_client(ac) ? 1 : 0;
-}
-
 static void q6asm_session_free(struct audio_client *ac)
 {
-	int session_id;
-	unsigned long flags;
-
 	pr_debug("%s: sessionid[%d]\n", __func__, ac->session);
-	session_id = ac->session;
 	rtac_remove_popp_from_adm_devices(ac->session);
-	spin_lock_irqsave(&(session[session_id].session_lock), flags);
-	session[ac->session].ac = NULL;
+	session[ac->session] = 0;
 	ac->session = 0;
 	ac->perf_mode = LEGACY_PCM_MODE;
 	ac->fptr_cache_ops = NULL;
-	ac->cb = NULL;
-	ac->priv = NULL;
-
-	kfree(ac);
-	spin_unlock_irqrestore(&(session[session_id].session_lock), flags);
 	return;
 }
 
@@ -940,6 +918,8 @@ void q6asm_audio_client_free(struct audio_client *ac)
 	pr_debug("%s: APR De-Register\n", __func__);
 
 /*done:*/
+	kfree(ac);
+	ac = NULL;
 	mutex_unlock(&session_lock);
 
 	return;
@@ -1008,7 +988,6 @@ struct audio_client *q6asm_audio_client_alloc(app_cb cb, void *priv)
 	if (n <= 0) {
 		pr_err("%s: ASM Session alloc fail n=%d\n", __func__, n);
 		mutex_unlock(&session_lock);
-		kfree(ac);
 		goto fail_session;
 	}
 	ac->session = n;
@@ -1084,6 +1063,7 @@ fail_apr2:
 fail_apr1:
 	q6asm_session_free(ac);
 fail_session:
+	kfree(ac);
 	return NULL;
 }
 
@@ -1098,11 +1078,11 @@ struct audio_client *q6asm_get_audio_client(int session_id)
 		goto err;
 	}
 
-	if (!(session[session_id].ac)) {
+	if (!session[session_id]) {
 		pr_err("%s: session not active: %d\n", __func__, session_id);
 		goto err;
 	}
-	return session[session_id].ac;
+	return session[session_id];
 err:
 	return NULL;
 }
@@ -1306,7 +1286,6 @@ static int32_t q6asm_srvc_callback(struct apr_client_data *data, void *priv)
 	uint32_t i = IN;
 	uint32_t *payload;
 	unsigned long dsp_flags;
-	unsigned long flags;
 	struct asm_buffer_node *buf_node = NULL;
 	struct list_head *ptr, *next;
 
@@ -1355,16 +1334,9 @@ static int32_t q6asm_srvc_callback(struct apr_client_data *data, void *priv)
 		return 0;
 	}
 	sid = (data->token >> 8) & 0x0F;
-	if ((sid > 0 && sid <= SESSION_MAX))
-		spin_lock_irqsave(&(session[sid].session_lock), flags);
-
 	ac = q6asm_get_audio_client(sid);
 	if (!ac) {
 		pr_debug("%s: session[%d] already freed\n", __func__, sid);
-		if ((sid > 0 &&
-			sid <= SESSION_MAX))
-			spin_unlock_irqrestore(
-				&(session[sid].session_lock), flags);
 		return 0;
 	}
 
@@ -1414,10 +1386,6 @@ static int32_t q6asm_srvc_callback(struct apr_client_data *data, void *priv)
 						__func__, payload[0]);
 			break;
 		}
-		if ((sid > 0 &&
-			sid <= SESSION_MAX))
-			spin_unlock_irqrestore(
-				&(session[sid].session_lock), flags);
 		return 0;
 	}
 
@@ -1453,10 +1421,6 @@ static int32_t q6asm_srvc_callback(struct apr_client_data *data, void *priv)
 	if (ac->cb)
 		ac->cb(data->opcode, data->token,
 			data->payload, ac->priv);
-	if ((sid > 0 && sid <= SESSION_MAX))
-		spin_unlock_irqrestore(
-			&(session[sid].session_lock), flags);
-
 	return 0;
 }
 
@@ -1493,8 +1457,7 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 	uint32_t *payload;
 	uint32_t wakeup_flag = 1;
 	int32_t  ret = 0;
-	unsigned long flags;
-	int session_id;
+
 
 	if (ac == NULL) {
 		pr_err("%s: ac NULL\n", __func__);
@@ -1504,21 +1467,15 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 		pr_err("%s: data NULL\n", __func__);
 		return -EINVAL;
 	}
-
-	session_id = q6asm_get_session_id_from_audio_client(ac);
-	if (session_id <= 0) {
-		pr_err("%s: Session ID is invalid, session = %d\n", __func__,
-			session_id);
-		return -EINVAL;
-	}
-
-	spin_lock_irqsave(&(session[session_id].session_lock), flags);
-
 	if (!q6asm_is_valid_audio_client(ac)) {
 		pr_err("%s: audio client pointer is invalid, ac = %pK\n",
 				__func__, ac);
-		spin_unlock_irqrestore(
-			&(session[session_id].session_lock), flags);
+		return -EINVAL;
+	}
+
+	if (ac->session <= 0 || ac->session > 8) {
+		pr_err("%s: Session ID is invalid, session = %d\n", __func__,
+			ac->session);
 		return -EINVAL;
 	}
 
@@ -1533,6 +1490,7 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 	}
 
 	if (data->opcode == RESET_EVENTS) {
+		mutex_lock(&ac->cmd_lock);
 		atomic_set(&ac->reset, 1);
 		if (ac->apr == NULL)
 			ac->apr = ac->apr2;
@@ -1548,8 +1506,7 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 		atomic_set(&ac->cmd_state, 0);
 		wake_up(&ac->time_wait);
 		wake_up(&ac->cmd_wait);
-		spin_unlock_irqrestore(
-			&(session[session_id].session_lock), flags);
+		mutex_unlock(&ac->cmd_lock);
 		return 0;
 	}
 
@@ -1560,16 +1517,9 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 		data->dest_port);
 	if ((data->opcode != ASM_DATA_EVENT_RENDERED_EOS) &&
 	    (data->opcode != ASM_DATA_EVENT_EOS) &&
-	    (data->opcode != ASM_SESSION_EVENT_RX_UNDERFLOW)) {
-		if (payload == NULL) {
-			pr_err("%s: payload is null\n", __func__);
-			spin_unlock_irqrestore(
-				&(session[session_id].session_lock), flags);
-			return -EINVAL;
-		}
+	    (data->opcode != ASM_SESSION_EVENT_RX_UNDERFLOW))
 		dev_vdbg(ac->dev, "%s: Payload = [0x%x] status[0x%x] opcode 0x%x\n",
 			__func__, payload[0], payload[1], data->opcode);
-	}
 	if (data->opcode == APR_BASIC_RSP_RESULT) {
 		token = data->token;
 		switch (payload[0]) {
@@ -1591,8 +1541,6 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 		ret = q6asm_is_valid_session(data, priv);
 		if (ret != 0) {
 			pr_err("%s: session invalid %d\n", __func__, ret);
-			spin_unlock_irqrestore(
-				&(session[session_id].session_lock), flags);
 			return ret;
 		}
 		case ASM_SESSION_CMD_SET_MTMX_STRTR_PARAMS_V2:
@@ -1618,9 +1566,6 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 					atomic_set(&ac->cmd_state, -payload[1]);
 					wake_up(&ac->cmd_wait);
 				}
-				spin_unlock_irqrestore(
-					&(session[session_id].session_lock),
-					flags);
 				return 0;
 			}
 			if (atomic_read(&ac->cmd_state) && wakeup_flag) {
@@ -1641,9 +1586,6 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 					atomic_set(&ac->mem_state, -payload[1]);
 					wake_up(&ac->mem_wait);
 				}
-				spin_unlock_irqrestore(
-					&(session[session_id].session_lock),
-					flags);
 				return 0;
 			}
 			if (atomic_read(&ac->mem_state) && wakeup_flag) {
@@ -1675,9 +1617,6 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 							__func__, payload[0]);
 			break;
 		}
-
-		spin_unlock_irqrestore(
-			&(session[session_id].session_lock), flags);
 		return 0;
 	}
 
@@ -1691,9 +1630,6 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 			if (port->buf == NULL) {
 				pr_err("%s: Unexpected Write Done\n",
 								__func__);
-				spin_unlock_irqrestore(
-					&(session[session_id].session_lock),
-					flags);
 				return -EINVAL;
 			}
 			spin_lock_irqsave(&port->dsp_lock, dsp_flags);
@@ -1707,9 +1643,6 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 					__func__, payload[0], payload[1]);
 				spin_unlock_irqrestore(&port->dsp_lock,
 								dsp_flags);
-				spin_unlock_irqrestore(
-					&(session[session_id].session_lock),
-					flags);
 				return -EINVAL;
 			}
 			token = data->token;
@@ -1781,9 +1714,6 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 		if (ac->io_mode & SYNC_IO_MODE) {
 			if (port->buf == NULL) {
 				pr_err("%s: Unexpected Write Done\n", __func__);
-				spin_unlock_irqrestore(
-					&(session[session_id].session_lock),
-					flags);
 				return -EINVAL;
 			}
 			spin_lock_irqsave(&port->dsp_lock, dsp_flags);
@@ -1852,8 +1782,7 @@ static int32_t q6asm_callback(struct apr_client_data *data, void *priv)
 	if (ac->cb)
 		ac->cb(data->opcode, data->token,
 			data->payload, ac->priv);
-	spin_unlock_irqrestore(
-		&(session[session_id].session_lock), flags);
+
 	return 0;
 }
 
@@ -1995,16 +1924,11 @@ int q6asm_is_dsp_buf_avail(int dir, struct audio_client *ac)
 static void __q6asm_add_hdr(struct audio_client *ac, struct apr_hdr *hdr,
 			uint32_t pkt_size, uint32_t cmd_flg, uint32_t stream_id)
 {
-	unsigned long flags;
-
 	dev_vdbg(ac->dev, "%s: pkt_size=%d cmd_flg=%d session=%d stream_id=%d\n",
 			__func__, pkt_size, cmd_flg, ac->session, stream_id);
 	mutex_lock(&ac->cmd_lock);
-	spin_lock_irqsave(&(session[ac->session].session_lock), flags);
 	if (ac->apr == NULL) {
 		pr_err("%s: AC APR handle NULL", __func__);
-		spin_unlock_irqrestore(
-			&(session[ac->session].session_lock), flags);
 		mutex_unlock(&ac->cmd_lock);
 		return;
 	}
@@ -2022,8 +1946,6 @@ static void __q6asm_add_hdr(struct audio_client *ac, struct apr_hdr *hdr,
 		hdr->token = ac->session;
 	}
 	hdr->pkt_size  = pkt_size;
-	spin_unlock_irqrestore(
-		&(session[ac->session].session_lock), flags);
 	mutex_unlock(&ac->cmd_lock);
 	return;
 }
@@ -5937,7 +5859,7 @@ int q6asm_get_apr_service_id(int session_id)
 		return -EINVAL;
 	}
 
-	return ((struct apr_svc *)(session[session_id].ac)->apr)->id;
+	return ((struct apr_svc *)session[session_id]->apr)->id;
 }
 
 int q6asm_get_asm_topology(void)
@@ -6155,10 +6077,7 @@ static int __init q6asm_init(void)
 	int lcnt, ret;
 	pr_debug("%s:\n", __func__);
 
-	memset(session, 0, sizeof(struct audio_session) *
-		(SESSION_MAX + 1));
-	for (lcnt = 0; lcnt <= SESSION_MAX; lcnt++)
-		spin_lock_init(&(session[lcnt].session_lock));
+	memset(session, 0, sizeof(session));
 	set_custom_topology = 1;
 
 	/*setup common client used for cal mem map */

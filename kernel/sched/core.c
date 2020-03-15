@@ -1986,9 +1986,9 @@ static void reset_all_task_stats(void)
 	struct task_struct *g, *p;
 
 	read_lock(&tasklist_lock);
-	do_each_thread(g, p) {
+	for_each_process_thread(g, p) {
 		reset_task_stats(p);
-	}  while_each_thread(g, p);
+	}
 	read_unlock(&tasklist_lock);
 }
 

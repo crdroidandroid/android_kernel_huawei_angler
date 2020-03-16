@@ -306,8 +306,10 @@ static void msm_restart_prepare(const char *cmd)
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_BOOTLOADER);
 			__raw_writel(0x77665500, restart_reason);
+#if 0
 		} else if (!strcmp(cmd, "dm-verity device corrupted")) {
 			__raw_writel(0x7766550D, restart_reason);
+#endif
 		} else if (!strncmp(cmd, "recovery", 8)) {
 			qpnp_pon_set_restart_reason(
 				PON_RESTART_REASON_RECOVERY);
